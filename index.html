@@ -10,9 +10,8 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Anton&family=Hanken+Grotesk:ital,wght@0,300..800;1,400..600&display=swap" rel="stylesheet">
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js"></script>
 
 <style>
 :root{
@@ -172,6 +171,20 @@ footer .credits{display:flex;flex-wrap:wrap;gap:6px 26px;font-size:.9rem;font-we
 footer .credits b{color:var(--bone)}
 
 @media(prefers-reduced-motion:reduce){*{animation:none!important;scroll-behavior:auto!important}}
+
+/* ---- MÓVIL ---- */
+@media(max-width:640px){
+  body{font-size:16px}
+  .hero-bg .blob{filter:blur(28px);opacity:.42}
+  .room{aspect-ratio:auto;min-height:62vh}
+  .mixer{gap:12px}
+  .mixplay{width:100%;justify-content:center}
+  .wave{width:100%;flex-basis:100%;min-width:0}
+  .stemctl{width:100%}
+  .detail{min-height:auto}
+  .player{right:12px;bottom:12px;padding:6px 6px 6px 14px}
+  .player .np .t{max-width:44vw}
+}
 </style>
 </head>
 
@@ -479,6 +492,7 @@ footer .credits b{color:var(--bone)}
 </div>
 
 <script>
+document.addEventListener('DOMContentLoaded', function(){
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const $ = s => document.querySelector(s);
 
@@ -588,63 +602,76 @@ if(window.gsap){
   }
 }
 
-/* ============ AUDIO — 4 STEMS (canción real) ============ */
-const STEMS = {
-  drums:'stems/drums.mp3', bass:'stems/bass.mp3', others:'stems/others.mp3', vocals:'stems/vocals.mp3'
-};
-let audioBuilt=false, playing=false, loading=false, master, waveA;
-const node={}; // stem -> {player,gain,fft}
+/* ============ LAYOUT RESPONSIVO DE ESFERAS ============ */
+const wave=$('#wave'), wctx=wave.getContext('2d');
+function layoutSpheres(){
+  const rw = room.clientWidth || 900;
+  const scale = Math.max(0.5, Math.min(1, rw/900));
+  spheres.forEach(el=>{
+    const s = Math.round(el._it.size*scale);
+    el.style.width=s+'px'; el.style.height=s+'px';
+    const sp=el.querySelector('span'); if(sp) sp.style.fontSize=Math.max(8, s*0.15)+'px';
+  });
+}
+let rzT; window.addEventListener('resize',()=>{ clearTimeout(rzT); rzT=setTimeout(layoutSpheres,150); });
 
-function buildAudio(){
-  if(audioBuilt) return;
-  master=new Tone.Gain(0.95).toDestination();
-  waveA=new Tone.Analyser('waveform',512); master.connect(waveA);
-  for(const k in STEMS){
-    const gain=new Tone.Gain(stemMuted[k]?0:1).connect(master);
-    const fft=new Tone.Analyser('fft',32); gain.connect(fft);
-    const player=new Tone.Player({url:STEMS[k],loop:true});
-    player.connect(gain); player.sync().start(0);
-    node[k]={player,gain,fft};
+/* ============ AUDIO — 4 STEMS en streaming (nativo, ligero para iPhone) ============ */
+const FILES = {drums:'stems/drums.mp3', bass:'stems/bass.mp3', others:'stems/others.mp3', vocals:'stems/vocals.mp3'};
+let ctx, master, waveA, waveData, built=false, playing=false, loading=false, rafId=0, driftC=0;
+const A={};
+function build(){
+  const AC = window.AudioContext||window.webkitAudioContext;
+  ctx = new AC();
+  master = ctx.createGain(); master.gain.value=0.95; master.connect(ctx.destination);
+  waveA = ctx.createAnalyser(); waveA.fftSize=1024; waveData=new Uint8Array(waveA.fftSize); master.connect(waveA);
+  for(const k in FILES){
+    const el=new Audio(); el.src=FILES[k]; el.loop=true; el.preload='auto'; el.playsInline=true; el.setAttribute('playsinline','');
+    const src=ctx.createMediaElementSource(el);
+    const gain=ctx.createGain(); gain.gain.value=stemMuted[k]?0:1;
+    const fft=ctx.createAnalyser(); fft.fftSize=64;
+    src.connect(gain); gain.connect(master); gain.connect(fft);
+    A[k]={el,gain,fft,data:new Uint8Array(fft.frequencyBinCount)};
   }
-  audioBuilt=true;
+  A.drums.el.addEventListener('playing',()=>{ if(loading){ loading=false; setState('playing'); } });
+  A.drums.el.addEventListener('error',()=>{ loading=false; playing=false; setState('idle'); $('#mixStatus').textContent='No encuentro los stems en /stems — súbelos para oír la mezcla.'; });
+  built=true;
 }
 function applyStemGains(){
-  if(!audioBuilt) return;
-  for(const k in node) node[k].gain.gain.rampTo(stemMuted[k]?0:1,0.05);
+  if(!built) return;
+  for(const k in A) A[k].gain.gain.setTargetAtTime(stemMuted[k]?0:1, ctx.currentTime, 0.02);
 }
-async function ensureLoaded(){
-  buildAudio();
-  try{ await Tone.loaded(); }catch(e){}
-  return Object.values(node).every(n=>n.player.loaded);
+function start(){
+  if(!built) build();
+  if(ctx.state==='suspended') ctx.resume();
+  loading=true; setState('loading'); $('#mixStatus').textContent='';
+  const t=(A.drums.el.currentTime)||0;
+  for(const k in A){ try{ A[k].el.currentTime=t; }catch(e){} A[k].el.play().catch(()=>{}); }
+  playing=true;
+  if(!rafId) loop();
+  setTimeout(()=>{ if(loading){ loading=false; setState('playing'); } }, 1600);
 }
-async function togglePlay(){
-  if(loading) return;
-  if(playing){ Tone.Transport.pause(); playing=false; setState('idle'); return; }
-  if(!audioBuilt || !Object.values(node).every(n=>n.player.loaded)){
-    loading=true; setState('loading');
-    const ok=await ensureLoaded(); loading=false;
-    if(!ok){ setState('idle'); $('#mixStatus').textContent='No encuentro los stems en /stems — súbelos para oír la mezcla.'; return; }
-    $('#mixStatus').textContent='';
-  }
-  await Tone.start(); Tone.Transport.start(); playing=true; setState('playing');
+function pause(){
+  for(const k in A){ A[k].el.pause(); }
+  playing=false; loading=false; setState('idle');
+  cancelAnimationFrame(rafId); rafId=0;
+  settle();
 }
+function togglePlay(){ if(loading) return; playing?pause():start(); }
+$('#mixBtn').addEventListener('click',togglePlay);
+$('#playBtn').addEventListener('click',togglePlay);
+
 function setState(mode){
   const midx=$('#mixIcon'), lbl=$('#mixBtn').childNodes[1], p=$('#player'), pb=$('#playBtn');
   if(mode==='loading'){ midx.textContent='…'; lbl.textContent=' Cargando…'; pb.textContent='…'; }
   else if(mode==='playing'){ midx.textContent='❚❚'; lbl.textContent=' Silenciar la mezcla'; pb.textContent='❚❚'; p.classList.remove('paused'); }
   else { midx.textContent='▶'; lbl.textContent=' Tocar la mezcla en vivo'; pb.textContent='▶'; p.classList.add('paused'); }
 }
-$('#mixBtn').addEventListener('click',togglePlay);
-$('#playBtn').addEventListener('click',togglePlay);
 
 /* ============ REACTIVIDAD + WAVEFORM ============ */
-const wave=$('#wave'), wctx=wave.getContext('2d');
-function bands(fft){
-  let lo=0,mi=0,hi=0,n1=0,n2=0,n3=0;
-  for(let i=0;i<fft.length;i++){
-    const v=Math.max(0,(fft[i]+100)/100);
-    if(i<5){lo+=v;n1++;} else if(i<16){mi+=v;n2++;} else {hi+=v;n3++;}
-  }
+function bandsFrom(u8){
+  let lo=0,mi=0,hi=0,n1=0,n2=0,n3=0,L=u8.length;
+  for(let i=0;i<L;i++){ const v=u8[i]/255, f=i/L;
+    if(f<0.15){lo+=v;n1++;} else if(f<0.5){mi+=v;n2++;} else {hi+=v;n3++;} }
   return {lo:lo/(n1||1),mi:mi/(n2||1),hi:hi/(n3||1)};
 }
 function pick(track,b){
@@ -655,34 +682,42 @@ function pick(track,b){
     case 'gtrA': case 'gtrB': return (b.lo+b.mi)/2;
     case 'keys': return b.mi;
     case 'horns': return b.hi;
-    default: return (b.lo+b.mi+b.hi)/3; // vox
+    default: return (b.lo+b.mi+b.hi)/3;
   }
 }
-function frame(){
-  requestAnimationFrame(frame);
-  // waveform
+function drawWave(){
   const w=wave.width,h=wave.height; wctx.clearRect(0,0,w,h);
   wctx.lineWidth=2; wctx.strokeStyle=playing?'#f0a81c':'rgba(200,180,144,.25)';
   wctx.beginPath();
-  if(audioBuilt && playing){
-    const buf=waveA.getValue();
-    for(let i=0;i<buf.length;i++){ const x=i/buf.length*w, y=h/2+buf[i]*h*0.9; i?wctx.lineTo(x,y):wctx.moveTo(x,y); }
-  } else { wctx.moveTo(0,h/2); wctx.lineTo(w,h/2); }
+  if(built && playing){ waveA.getByteTimeDomainData(waveData);
+    for(let i=0;i<waveData.length;i+=3){ const x=i/waveData.length*w, y=(waveData[i]/255)*h; i?wctx.lineTo(x,y):wctx.moveTo(x,y); } }
+  else { wctx.moveTo(0,h/2); wctx.lineTo(w,h/2); }
   wctx.stroke();
-  // esferas
+}
+function settle(){
+  spheres.forEach(el=>{ el._r=0; el._pos.style.transform='translate(-50%,-50%) scale(1)'; el.style.filter=''; });
+  drawWave();
+}
+function loop(){
+  rafId=requestAnimationFrame(loop);
+  drawWave();
+  if((driftC=(driftC+1)%75)===0 && playing){ const ref=A.drums.el.currentTime;
+    for(const k in A){ if(k!=='drums'){ const d=A[k].el; if(Math.abs(d.currentTime-ref)>0.12){ try{d.currentTime=ref;}catch(e){} } } } }
   if(reduce) return;
   const en={};
-  if(audioBuilt && playing){ for(const k in node) en[k]=bands(node[k].fft.getValue()); }
+  for(const k in A){ A[k].fft.getByteFrequencyData(A[k].data); en[k]=bandsFrom(A[k].data); }
   spheres.forEach(el=>{
-    const it=el._it;
-    let target=0;
-    if(audioBuilt && playing && !stemMuted[it.stem]) target=Math.min(1,pick(it.track,en[it.stem])*1.7);
+    const it=el._it; let target=0;
+    if(playing && !stemMuted[it.stem]) target=Math.min(1, pick(it.track,en[it.stem])*1.25);
     el._r += (target-el._r)*0.35;
     el._pos.style.transform='translate(-50%,-50%) scale('+(1+el._r*0.30).toFixed(3)+')';
     el.style.filter = el._r>0.01 ? 'brightness('+(1+el._r*0.7).toFixed(2)+')' : '';
   });
 }
-requestAnimationFrame(frame);
+
+layoutSpheres();
+drawWave();
+});
 </script>
 </body>
 </html>
